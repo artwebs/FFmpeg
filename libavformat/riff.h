@@ -45,7 +45,7 @@ void ff_end_tag(AVIOContext *pb, int64_t start);
  */
 int ff_get_bmp_header(AVIOContext *pb, AVStream *st, unsigned *esize);
 
-void ff_put_bmp_header(AVIOContext *pb, AVCodecParameters *par, const AVCodecTag *tags, int for_asf, int ignore_extradata);
+void ff_put_bmp_header(AVIOContext *pb, AVCodecParameters *par, int for_asf, int ignore_extradata);
 
 /**
  * Tell ff_put_wav_header() to use WAVEFORMATEX even for PCM codecs.
@@ -109,6 +109,8 @@ extern const AVCodecGuid ff_codec_wav_guids[];
     0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA, 0x00, 0x38, 0x9B, 0x71
 #define FF_AMBISONIC_BASE_GUID \
     0x21, 0x07, 0xD3, 0x11, 0x86, 0x44, 0xC8, 0xC1, 0xCA, 0x00, 0x00, 0x00
+#define FF_BROKEN_BASE_GUID \
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x80, 0x00, 0x00, 0xAA
 
 static av_always_inline int ff_guidcmp(const void *g1, const void *g2)
 {

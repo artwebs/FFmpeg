@@ -50,7 +50,7 @@ typedef struct MJpegDecodeContext {
     int buffer_size;
     uint8_t *buffer;
 
-    int16_t quant_matrixes[4][64];
+    uint16_t quant_matrixes[4][64];
     VLC vlcs[3][4];
     int qscale[4];      ///< quantizer scale calculated from quant_matrixes
 
@@ -130,6 +130,11 @@ typedef struct MJpegDecodeContext {
     AVStereo3D *stereo3d; ///!< stereoscopic information (cached, since it is read before frame allocation)
 
     const AVPixFmtDescriptor *pix_desc;
+
+    uint8_t **iccdata;
+    int *iccdatalens;
+    int iccnum;
+    int iccread;
 } MJpegDecodeContext;
 
 int ff_mjpeg_decode_init(AVCodecContext *avctx);

@@ -55,6 +55,7 @@ typedef struct OpusEncContext {
     AudioFrameQueue afq;
     AVFloatDSPContext *dsp;
     MDCT15Context *mdct[CELT_BLOCK_NB];
+    CeltPVQ *pvq;
     struct FFBufQueue bufqueue;
 
     enum OpusMode mode;
@@ -206,20 +207,18 @@ static void celt_apply_preemph_filter(OpusEncContext *s, CeltFrame *f)
 /* Create the window and do the mdct */
 static void celt_frame_mdct(OpusEncContext *s, CeltFrame *f)
 {
-    int i, t, ch;
-    float *win = s->scratch;
+    int t, ch;
+    float *win = s->scratch, *temp = s->scratch + 1920;
 
-    /* I think I can use s->dsp->vector_fmul_window for transients at least */
     if (f->transient) {
         for (ch = 0; ch < f->channels; ch++) {
             CeltBlock *b = &f->block[ch];
             float *src1 = b->overlap;
             for (t = 0; t < f->blocks; t++) {
                 float *src2 = &b->samples[CELT_OVERLAP*t];
-                for (i = 0; i < CELT_OVERLAP; i++) {
-                    win[               i] = src1[i]*ff_celt_window[i];
-                    win[CELT_OVERLAP + i] = src2[i]*ff_celt_window[CELT_OVERLAP - i - 1];
-                }
+                s->dsp->vector_fmul(win, src1, ff_celt_window, 128);
+                s->dsp->vector_fmul_reverse(&win[CELT_OVERLAP], src2,
+                                            ff_celt_window - 8, 128);
                 src1 = src2;
                 s->mdct[0]->mdct(s->mdct[0], b->coeffs + t, win, f->blocks);
             }
@@ -227,21 +226,21 @@ static void celt_frame_mdct(OpusEncContext *s, CeltFrame *f)
     } else {
         int blk_len = OPUS_BLOCK_SIZE(f->size), wlen = OPUS_BLOCK_SIZE(f->size + 1);
         int rwin = blk_len - CELT_OVERLAP, lap_dst = (wlen - blk_len - CELT_OVERLAP) >> 1;
+        memset(win, 0, wlen*sizeof(float));
         for (ch = 0; ch < f->channels; ch++) {
             CeltBlock *b = &f->block[ch];
 
-            memset(win, 0, wlen*sizeof(float));
+            /* Overlap */
+            s->dsp->vector_fmul(temp, b->overlap, ff_celt_window, 128);
+            memcpy(win + lap_dst, temp, CELT_OVERLAP*sizeof(float));
 
+            /* Samples, flat top window */
             memcpy(&win[lap_dst + CELT_OVERLAP], b->samples, rwin*sizeof(float));
 
-            /* Alignment fucks me over */
-            //s->dsp->vector_fmul(&dst[lap_dst], b->overlap, ff_celt_window, CELT_OVERLAP);
-            //s->dsp->vector_fmul_reverse(&dst[lap_dst + blk_len - CELT_OVERLAP], b->samples, ff_celt_window, CELT_OVERLAP);
-
-            for (i = 0; i < CELT_OVERLAP; i++) {
-                win[lap_dst           + i] = b->overlap[i]       *ff_celt_window[i];
-                win[lap_dst + blk_len + i] = b->samples[rwin + i]*ff_celt_window[CELT_OVERLAP - i - 1];
-            }
+            /* Samples, windowed */
+            s->dsp->vector_fmul_reverse(temp, b->samples + rwin,
+                                        ff_celt_window - 8, 128);
+            memcpy(win + lap_dst + blk_len, temp, CELT_OVERLAP*sizeof(float));
 
             s->mdct[f->size]->mdct(s->mdct[f->size], b->coeffs, win, 1);
         }
@@ -249,42 +248,36 @@ static void celt_frame_mdct(OpusEncContext *s, CeltFrame *f)
 }
 
 /* Fills the bands and normalizes them */
-static int celt_frame_map_norm_bands(OpusEncContext *s, CeltFrame *f)
+static void celt_frame_map_norm_bands(OpusEncContext *s, CeltFrame *f)
 {
-    int i, j, ch, noise = 0;
+    int i, j, ch;
 
     for (ch = 0; ch < f->channels; ch++) {
         CeltBlock *block = &f->block[ch];
-        float *start = block->coeffs;
         for (i = 0; i < CELT_MAX_BANDS; i++) {
             float ener = 0.0f;
+            int band_offset = ff_celt_freq_bands[i] << f->size;
+            int band_size   = ff_celt_freq_range[i] << f->size;
+            float *coeffs   = &block->coeffs[band_offset];
 
-            /* Calculate band bins */
-            block->band_bins[i] = ff_celt_freq_range[i] << f->size;
-            block->band_coeffs[i] = start;
-            start += block->band_bins[i];
-
-            /* Normalize band energy */
-            for (j = 0; j < block->band_bins[i]; j++)
-                ener += block->band_coeffs[i][j]*block->band_coeffs[i][j];
+            for (j = 0; j < band_size; j++)
+                ener += coeffs[j]*coeffs[j];
 
             block->lin_energy[i] = sqrtf(ener) + FLT_EPSILON;
             ener = 1.0f/block->lin_energy[i];
 
-            for (j = 0; j < block->band_bins[i]; j++)
-                block->band_coeffs[i][j] *= ener;
+            for (j = 0; j < band_size; j++)
+                coeffs[j] *= ener;
 
             block->energy[i] = log2f(block->lin_energy[i]) - ff_celt_mean_energy[i];
 
             /* CELT_ENERGY_SILENCE is what the decoder uses and its not -infinity */
             block->energy[i] = FFMAX(block->energy[i], CELT_ENERGY_SILENCE);
-            noise |= block->energy[i] > CELT_ENERGY_SILENCE;
         }
     }
-    return !noise;
 }
 
-static void celt_enc_tf(OpusEncContext *s, OpusRangeCoder *rc, CeltFrame *f)
+static void celt_enc_tf(OpusRangeCoder *rc, CeltFrame *f)
 {
     int i, tf_select = 0, diff = 0, tf_changed = 0, tf_select_needed;
     int bits = f->transient ? 2 : 4;
@@ -311,7 +304,7 @@ static void celt_enc_tf(OpusEncContext *s, OpusRangeCoder *rc, CeltFrame *f)
         f->tf_change[i] = ff_celt_tf_select[f->size][f->transient][tf_select][f->tf_change[i]];
 }
 
-static void celt_bitalloc(OpusEncContext *s, OpusRangeCoder *rc, CeltFrame *f)
+static void ff_celt_enc_bitalloc(OpusRangeCoder *rc, CeltFrame *f)
 {
     int i, j, low, high, total, done, bandbits, remaining, tbits_8ths;
     int skip_startband      = f->start_band;
@@ -636,31 +629,32 @@ static void celt_bitalloc(OpusEncContext *s, OpusRangeCoder *rc, CeltFrame *f)
     }
 }
 
-static void celt_quant_coarse(OpusEncContext *s, OpusRangeCoder *rc, CeltFrame *f)
+static void exp_quant_coarse(OpusRangeCoder *rc, CeltFrame *f,
+                             float last_energy[][CELT_MAX_BANDS], int intra)
 {
     int i, ch;
     float alpha, beta, prev[2] = { 0, 0 };
-    const uint8_t *pmod = ff_celt_coarse_energy_dist[f->size][f->intra];
+    const uint8_t *pmod = ff_celt_coarse_energy_dist[f->size][intra];
 
     /* Inter is really just differential coding */
     if (opus_rc_tell(rc) + 3 <= f->framebits)
-        ff_opus_rc_enc_log(rc, f->intra, 3);
+        ff_opus_rc_enc_log(rc, intra, 3);
     else
-        f->intra = 0;
+        intra = 0;
 
-    if (f->intra) {
+    if (intra) {
         alpha = 0.0f;
-        beta  = 1.0f - 4915.0f/32768.0f;
+        beta  = 1.0f - (4915.0f/32768.0f);
     } else {
         alpha = ff_celt_alpha_coef[f->size];
-        beta  = 1.0f - ff_celt_beta_coef[f->size];
+        beta  = ff_celt_beta_coef[f->size];
     }
 
     for (i = f->start_band; i < f->end_band; i++) {
         for (ch = 0; ch < f->channels; ch++) {
             CeltBlock *block = &f->block[ch];
             const int left = f->framebits - opus_rc_tell(rc);
-            const float last = FFMAX(-9.0f, s->last_quantized_energy[ch][i]);
+            const float last = FFMAX(-9.0f, last_energy[ch][i]);
             float diff = block->energy[i] - prev[ch] - last*alpha;
             int q_en = lrintf(diff);
             if (left >= 15) {
@@ -679,7 +673,27 @@ static void celt_quant_coarse(OpusEncContext *s, OpusRangeCoder *rc, CeltFrame *
     }
 }
 
-static void celt_quant_fine(OpusEncContext *s, OpusRangeCoder *rc, CeltFrame *f)
+static void celt_quant_coarse(OpusRangeCoder *rc, CeltFrame *f,
+                              float last_energy[][CELT_MAX_BANDS])
+{
+    uint32_t inter, intra;
+    OPUS_RC_CHECKPOINT_SPAWN(rc);
+
+    exp_quant_coarse(rc, f, last_energy, 1);
+    intra = OPUS_RC_CHECKPOINT_BITS(rc);
+
+    OPUS_RC_CHECKPOINT_ROLLBACK(rc);
+
+    exp_quant_coarse(rc, f, last_energy, 0);
+    inter = OPUS_RC_CHECKPOINT_BITS(rc);
+
+    if (inter > intra) { /* Unlikely */
+        OPUS_RC_CHECKPOINT_ROLLBACK(rc);
+        exp_quant_coarse(rc, f, last_energy, 1);
+    }
+}
+
+static void celt_quant_fine(OpusRangeCoder *rc, CeltFrame *f)
 {
     int i, ch;
     for (i = f->start_band; i < f->end_band; i++) {
@@ -716,7 +730,7 @@ static void celt_quant_final(OpusEncContext *s, OpusRangeCoder *rc, CeltFrame *f
     }
 }
 
-static void celt_quant_bands(OpusEncContext *s, OpusRangeCoder *rc, CeltFrame *f)
+static void celt_quant_bands(OpusRangeCoder *rc, CeltFrame *f)
 {
     float lowband_scratch[8 * 22];
     float norm[2 * 8 * 100];
@@ -729,6 +743,7 @@ static void celt_quant_bands(OpusEncContext *s, OpusRangeCoder *rc, CeltFrame *f
     int i, j;
 
     for (i = f->start_band; i < f->end_band; i++) {
+        uint32_t cm[2] = { (1 << f->blocks) - 1, (1 << f->blocks) - 1 };
         int band_offset = ff_celt_freq_bands[i] << f->size;
         int band_size   = ff_celt_freq_range[i] << f->size;
         float *X = f->block[0].coeffs + band_offset;
@@ -737,8 +752,7 @@ static void celt_quant_bands(OpusEncContext *s, OpusRangeCoder *rc, CeltFrame *f
         int consumed = opus_rc_tell_frac(rc);
         float *norm2 = norm + 8 * 100;
         int effective_lowband = -1;
-        unsigned int cm[2];
-        int b;
+        int b = 0;
 
         /* Compute how many bits we want to allocate to this band */
         if (i != f->start_band)
@@ -747,8 +761,7 @@ static void celt_quant_bands(OpusEncContext *s, OpusRangeCoder *rc, CeltFrame *f
         if (i <= f->coded_bands - 1) {
             int curr_balance = f->remaining / FFMIN(3, f->coded_bands-i);
             b = av_clip_uintp2(FFMIN(f->remaining2 + 1, f->pulses[i] + curr_balance), 14);
-        } else
-            b = 0;
+        }
 
         if (ff_celt_freq_bands[i] - ff_celt_freq_range[i] >= ff_celt_freq_bands[f->start_band] &&
             (update_lowband || lowband_offset == 0))
@@ -773,10 +786,7 @@ static void celt_quant_bands(OpusEncContext *s, OpusRangeCoder *rc, CeltFrame *f
                 cm[0] |= f->block[0].collapse_masks[j];
                 cm[1] |= f->block[f->channels - 1].collapse_masks[j];
             }
-        } else
-            /* Otherwise, we'll be using the LCG to fold, so all blocks will (almost
-            always) be non-zero.*/
-            cm[0] = cm[1] = (1 << f->blocks) - 1;
+        }
 
         if (f->dual_stereo && i == f->intensity_stereo) {
             /* Switch off dual stereo to do intensity */
@@ -786,17 +796,17 @@ static void celt_quant_bands(OpusEncContext *s, OpusRangeCoder *rc, CeltFrame *f
         }
 
         if (f->dual_stereo) {
-            cm[0] = ff_celt_encode_band(f, rc, i, X, NULL, band_size, b / 2, f->blocks,
+            cm[0] = f->pvq->encode_band(f->pvq, f, rc, i, X, NULL, band_size, b / 2, f->blocks,
                                         effective_lowband != -1 ? norm + (effective_lowband << f->size) : NULL, f->size,
                                         norm + band_offset, 0, 1.0f, lowband_scratch, cm[0]);
 
-            cm[1] = ff_celt_encode_band(f, rc, i, Y, NULL, band_size, b/2, f->blocks,
+            cm[1] = f->pvq->encode_band(f->pvq, f, rc, i, Y, NULL, band_size, b / 2, f->blocks,
                                         effective_lowband != -1 ? norm2 + (effective_lowband << f->size) : NULL, f->size,
                                         norm2 + band_offset, 0, 1.0f, lowband_scratch, cm[1]);
         } else {
-            cm[0] = ff_celt_encode_band(f, rc, i, X, Y, band_size, b, f->blocks,
+            cm[0] = f->pvq->encode_band(f->pvq, f, rc, i, X, Y, band_size, b, f->blocks,
                                         effective_lowband != -1 ? norm + (effective_lowband << f->size) : NULL, f->size,
-                                        norm + band_offset, 0, 1.0f, lowband_scratch, cm[0]|cm[1]);
+                                        norm + band_offset, 0, 1.0f, lowband_scratch, cm[0] | cm[1]);
             cm[1] = cm[0];
         }
 
@@ -819,11 +829,7 @@ static void celt_encode_frame(OpusEncContext *s, OpusRangeCoder *rc, CeltFrame *
         /* Not implemented */
     }
     celt_frame_mdct(s, f);
-    f->silence = celt_frame_map_norm_bands(s, f);
-    if (f->silence) {
-        f->framebits = 1;
-        return;
-    }
+    celt_frame_map_norm_bands(s, f);
 
     ff_opus_rc_enc_log(rc, f->silence, 15);
 
@@ -837,11 +843,11 @@ static void celt_encode_frame(OpusEncContext *s, OpusRangeCoder *rc, CeltFrame *
     if (f->size && opus_rc_tell(rc) + 3 <= f->framebits)
         ff_opus_rc_enc_log(rc, f->transient, 3);
 
-    celt_quant_coarse (s, rc, f);
-    celt_enc_tf       (s, rc, f);
-    celt_bitalloc     (s, rc, f);
-    celt_quant_fine   (s, rc, f);
-    celt_quant_bands  (s, rc, f);
+    celt_quant_coarse(rc, f, s->last_quantized_energy);
+    celt_enc_tf      (rc, f);
+    ff_celt_enc_bitalloc(rc, f);
+    celt_quant_fine  (rc, f);
+    celt_quant_bands (rc, f);
 
     if (f->anticollapse_needed)
         ff_opus_rc_put_raw(rc, f->anticollapse, 1);
@@ -876,6 +882,7 @@ static void ff_opus_psy_celt_frame_setup(OpusEncContext *s, CeltFrame *f, int in
 
     f->avctx = s->avctx;
     f->dsp = s->dsp;
+    f->pvq = s->pvq;
     f->start_band = (s->mode == OPUS_MODE_HYBRID) ? 17 : 0;
     f->end_band = ff_celt_band_end[s->bandwidth];
     f->channels = s->channels;
@@ -885,7 +892,6 @@ static void ff_opus_psy_celt_frame_setup(OpusEncContext *s, CeltFrame *f, int in
     f->silence = 0;
     f->pfilter = 0;
     f->transient = 0;
-    f->intra = 1;
     f->tf_select = 0;
     f->anticollapse = 0;
     f->alloc_trim = 5;
@@ -1013,6 +1019,7 @@ static av_cold int opus_encode_end(AVCodecContext *avctx)
     for (i = 0; i < CELT_BLOCK_NB; i++)
         ff_mdct15_uninit(&s->mdct[i]);
 
+    ff_celt_pvq_uninit(&s->pvq);
     av_freep(&s->dsp);
     av_freep(&s->frame);
     av_freep(&s->rc);
@@ -1040,14 +1047,12 @@ static av_cold int opus_encode_init(AVCodecContext *avctx)
     /* Initial padding will change if SILK is ever supported */
     avctx->initial_padding = 120;
 
-    avctx->cutoff = !avctx->cutoff ? 20000 : avctx->cutoff;
-
     if (!avctx->bit_rate) {
         int coupled = ff_opus_default_coupled_streams[s->channels - 1];
         avctx->bit_rate = coupled*(96000) + (s->channels - coupled*2)*(48000);
     } else if (avctx->bit_rate < 6000 || avctx->bit_rate > 255000 * s->channels) {
         int64_t clipped_rate = av_clip(avctx->bit_rate, 6000, 255000 * s->channels);
-        av_log(avctx, AV_LOG_ERROR, "Unsupported bitrate %li kbps, clipping to %li kbps\n",
+        av_log(avctx, AV_LOG_ERROR, "Unsupported bitrate %"PRId64" kbps, clipping to %"PRId64" kbps\n",
                avctx->bit_rate/1000, clipped_rate/1000);
         avctx->bit_rate = clipped_rate;
     }
@@ -1069,6 +1074,9 @@ static av_cold int opus_encode_init(AVCodecContext *avctx)
 
     ff_af_queue_init(avctx, &s->afq);
 
+    if ((ret = ff_celt_pvq_init(&s->pvq)) < 0)
+        return ret;
+
     if (!(s->dsp = avpriv_float_dsp_alloc(avctx->flags & AV_CODEC_FLAG_BITEXACT)))
         return AVERROR(ENOMEM);
 
@@ -1076,6 +1084,11 @@ static av_cold int opus_encode_init(AVCodecContext *avctx)
     for (i = 0; i < CELT_BLOCK_NB; i++)
         if ((ret = ff_mdct15_init(&s->mdct[i], 0, i + 3, 68 << (CELT_BLOCK_NB - 1 - i))))
             return AVERROR(ENOMEM);
+
+    for (i = 0; i < OPUS_MAX_FRAMES_PER_PACKET; i++) {
+        s->frame[i].block[0].emph_coeff = s->frame[i].block[1].emph_coeff = 0.0f;
+        s->frame[i].seed = 0;
+    }
 
     /* Zero out previous energy (matters for inter first frame) */
     for (ch = 0; ch < s->channels; ch++)

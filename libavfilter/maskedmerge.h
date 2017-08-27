@@ -22,11 +22,12 @@
 #define AVFILTER_MASKEDMERGE_H
 
 #include "avfilter.h"
-#include "framesync.h"
+#include "framesync2.h"
 
 typedef struct MaskedMergeContext {
     const AVClass *class;
     int width[4], height[4];
+    int linesize[4];
     int nb_planes;
     int planes;
     int half, depth;

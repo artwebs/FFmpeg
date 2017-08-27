@@ -109,8 +109,8 @@ static void ssim_4x4xn_16bit(const uint8_t *main8, ptrdiff_t main_stride,
 
         for (y = 0; y < 4; y++) {
             for (x = 0; x < 4; x++) {
-                int a = main16[x + y * main_stride];
-                int b = ref16[x + y * ref_stride];
+                unsigned a = main16[x + y * main_stride];
+                unsigned b = ref16[x + y * ref_stride];
 
                 s1  += a;
                 s2  += b;
@@ -219,6 +219,8 @@ static float ssim_endn_8bit(const int (*sum0)[4], const int (*sum1)[4], int widt
     return ssim;
 }
 
+#define SUM_LEN(w) (((w) >> 2) + 3)
+
 static float ssim_plane_16bit(SSIMDSPContext *dsp,
                               uint8_t *main, int main_stride,
                               uint8_t *ref, int ref_stride,
@@ -228,7 +230,7 @@ static float ssim_plane_16bit(SSIMDSPContext *dsp,
     int z = 0, y;
     float ssim = 0.0;
     int64_t (*sum0)[4] = temp;
-    int64_t (*sum1)[4] = sum0 + (width >> 2) + 3;
+    int64_t (*sum1)[4] = sum0 + SUM_LEN(width);
 
     width >>= 2;
     height >>= 2;
@@ -256,7 +258,7 @@ static float ssim_plane(SSIMDSPContext *dsp,
     int z = 0, y;
     float ssim = 0.0;
     int (*sum0)[4] = temp;
-    int (*sum1)[4] = sum0 + (width >> 2) + 3;
+    int (*sum1)[4] = sum0 + SUM_LEN(width);
 
     width >>= 2;
     height >>= 2;
@@ -283,7 +285,7 @@ static double ssim_db(double ssim, double weight)
 static AVFrame *do_ssim(AVFilterContext *ctx, AVFrame *main,
                         const AVFrame *ref)
 {
-    AVDictionary **metadata = avpriv_frame_get_metadatap(main);
+    AVDictionary **metadata = &main->metadata;
     SSIMContext *s = ctx->priv;
     float c[4], ssimv = 0.0;
     int i;
@@ -350,7 +352,7 @@ static av_cold int init(AVFilterContext *ctx)
 static int query_formats(AVFilterContext *ctx)
 {
     static const enum AVPixelFormat pix_fmts[] = {
-        AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY10,
+        AV_PIX_FMT_GRAY8, AV_PIX_FMT_GRAY9, AV_PIX_FMT_GRAY10,
         AV_PIX_FMT_GRAY12, AV_PIX_FMT_GRAY16,
         AV_PIX_FMT_YUV420P, AV_PIX_FMT_YUV422P, AV_PIX_FMT_YUV444P,
         AV_PIX_FMT_YUV440P, AV_PIX_FMT_YUV411P, AV_PIX_FMT_YUV410P,
@@ -402,7 +404,7 @@ static int config_input_ref(AVFilterLink *inlink)
     for (i = 0; i < s->nb_components; i++)
         s->coefs[i] = (double) s->planeheight[i] * s->planewidth[i] / sum;
 
-    s->temp = av_malloc_array((2 * inlink->w + 12), sizeof(*s->temp) * (1 + (desc->comp[0].depth > 8)));
+    s->temp = av_mallocz_array(2 * SUM_LEN(inlink->w), (desc->comp[0].depth > 8) ? sizeof(int64_t[4]) : sizeof(int[4]));
     if (!s->temp)
         return AVERROR(ENOMEM);
     s->max = (1 << desc->comp[0].depth) - 1;

@@ -106,11 +106,11 @@ FF_ENABLE_DEPRECATION_WARNINGS
         if (!avctx->stats_out)
             return AVERROR(ENOMEM);
     }
-    if((avctx->flags&AV_CODEC_FLAG_PASS2) || !(avctx->flags&CODEC_FLAG_QSCALE)){
+    if((avctx->flags&AV_CODEC_FLAG_PASS2) || !(avctx->flags&AV_CODEC_FLAG_QSCALE)){
         if(ff_rate_control_init(&s->m) < 0)
             return -1;
     }
-    s->pass1_rc= !(avctx->flags & (AV_CODEC_FLAG_QSCALE|CODEC_FLAG_PASS2));
+    s->pass1_rc= !(avctx->flags & (AV_CODEC_FLAG_QSCALE|AV_CODEC_FLAG_PASS2));
 
     switch(avctx->pix_fmt){
     case AV_PIX_FMT_YUV444P:
@@ -1644,8 +1644,12 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
     }
 
     ff_snow_frame_start(s);
+#if FF_API_CODED_FRAME
+FF_DISABLE_DEPRECATION_WARNINGS
     av_frame_unref(avctx->coded_frame);
     ret = av_frame_ref(avctx->coded_frame, s->current_picture);
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
     if (ret < 0)
         return ret;
 
@@ -1675,7 +1679,9 @@ static int encode_frame(AVCodecContext *avctx, AVPacket *pkt,
         s->m.f_code=1;
         s->m.pict_type = pic->pict_type;
 #if FF_API_MOTION_EST
+FF_DISABLE_DEPRECATION_WARNINGS
         s->m.me_method= s->avctx->me_method;
+FF_ENABLE_DEPRECATION_WARNINGS
 #endif
         s->m.motion_est= s->motion_est;
         s->m.me.scene_change_score=0;
@@ -1878,10 +1884,14 @@ FF_ENABLE_DEPRECATION_WARNINGS
     if(avctx->flags&AV_CODEC_FLAG_PASS1)
         ff_write_pass1_stats(&s->m);
     s->m.last_pict_type = s->m.pict_type;
+#if FF_API_STAT_BITS
+FF_DISABLE_DEPRECATION_WARNINGS
     avctx->frame_bits = s->m.frame_bits;
     avctx->mv_bits = s->m.mv_bits;
     avctx->misc_bits = s->m.misc_bits;
     avctx->p_tex_bits = s->m.p_tex_bits;
+FF_ENABLE_DEPRECATION_WARNINGS
+#endif
 
     emms_c();
 
